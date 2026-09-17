@@ -1,29 +1,27 @@
+import glob
 import os
 import shutil
-import subprocess
 import tempfile
 from typing import Any, Dict
 
 from youtube_transcript_api import YouTubeTranscriptApi
 from faster_whisper import WhisperModel
+from yt_dlp import YoutubeDL
 
 
-# Small is a good starting point for local development.
-# Change to "medium", "large-v3", etc. later when hardware allows.
+# -----------------------------
+# Whisper configuration
+# -----------------------------
+
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
-
-# "cpu" works on a normal Mac/PC.
-# For a supported NVIDIA GPU, set WHISPER_DEVICE=cuda.
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
-
-# int8 is efficient for CPU inference.
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 
 _model = None
 
 
 def get_whisper_model():
-    """Load the Whisper model once and reuse it between requests."""
+    """Load Whisper once and reuse it."""
     global _model
 
     if _model is None:
@@ -36,8 +34,13 @@ def get_whisper_model():
     return _model
 
 
+# -----------------------------
+# YouTube captions
+# -----------------------------
+
 def get_caption_transcript(video_id: str) -> Dict[str, Any]:
-    """Try an accessible YouTube caption track first."""
+    """Try YouTube captions first."""
+
     api = YouTubeTranscriptApi()
     transcript = api.fetch(video_id)
 
@@ -47,11 +50,14 @@ def get_caption_transcript(video_id: str) -> Dict[str, Any]:
         start = float(item.start)
         duration = float(item.duration)
 
-        segments.append({
-            "start": start,
-            "end": start + duration,
-            "text": item.text.strip(),
-        })
+        text = item.text.strip()
+
+        if text:
+            segments.append({
+                "start": start,
+                "end": start + duration,
+                "text": text,
+            })
 
     return {
         "video_id": video_id,
@@ -61,60 +67,77 @@ def get_caption_transcript(video_id: str) -> Dict[str, Any]:
     }
 
 
+# -----------------------------
+# Audio download
+# -----------------------------
+
 def download_audio(video_id: str, output_dir: str) -> str:
     """
-    Obtain audio for authorized content using yt-dlp.
+    Download audio using the yt-dlp Python API.
 
-    Requires yt-dlp and ffmpeg to be installed.
+    We intentionally do NOT convert to MP3 here.
+    Faster-Whisper/PyAV can decode common audio formats directly.
+
+    This avoids depending on the yt-dlp executable being in PATH
+    and avoids requiring FFmpeg just for transcription.
     """
-    output_template = os.path.join(output_dir, "audio.%(ext)s")
 
-    command = [
-        "yt-dlp",
-        "--no-playlist",
-        "-x",
-        "--audio-format", "mp3",
-        "--audio-quality", "64K",
-        "-o", output_template,
-        "https://www.youtube.com/watch?v={}".format(video_id),
-    ]
+    url = "https://www.youtube.com/watch?v={}".format(video_id)
+
+    output_template = os.path.join(
+        output_dir,
+        "audio.%(ext)s"
+    )
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "noplaylist": True,
+        "quiet": False,
+        "no_warnings": False,
+    }
 
     try:
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            timeout=1800,
-        )
-    except FileNotFoundError:
-        raise ValueError("yt-dlp is not installed. Run: pip install yt-dlp")
-    except subprocess.TimeoutExpired:
-        raise ValueError("Audio download timed out.")
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
 
-    if result.returncode != 0:
+    except Exception as exc:
         raise ValueError(
-            "Could not obtain audio. Make sure you are authorized to process "
-            "the content and that yt-dlp/ffmpeg can access it.\n{}"
-            .format(result.stderr[-2000:])
+            "Could not obtain audio with yt-dlp: {}".format(str(exc))
         )
 
-    audio_path = os.path.join(output_dir, "audio.mp3")
+    # Find the downloaded audio file.
+    files = glob.glob(
+        os.path.join(output_dir, "audio.*")
+    )
 
-    if not os.path.exists(audio_path):
-        raise ValueError("Audio extraction did not produce an MP3 file.")
+    files = [
+        path for path in files
+        if not path.endswith(".part")
+    ]
 
-    return audio_path
+    if not files:
+        raise ValueError(
+            "yt-dlp completed but no audio file was produced."
+        )
 
+    return files[0]
+
+
+# -----------------------------
+# Faster-Whisper
+# -----------------------------
 
 def transcribe_with_whisper(audio_path: str) -> Dict[str, Any]:
-    """Transcribe audio locally with faster-whisper."""
+    """Transcribe audio using Faster-Whisper."""
+
     model = get_whisper_model()
 
     segments_iter, info = model.transcribe(
         audio_path,
         beam_size=5,
-        vad_filter=True,
+        vad_filter=False,
+        task="transcribe",
     )
 
     segments = []
@@ -136,25 +159,48 @@ def transcribe_with_whisper(audio_path: str) -> Dict[str, Any]:
     }
 
 
+# -----------------------------
+# Main transcript pipeline
+# -----------------------------
+
 def get_transcript(video_id: str) -> Dict[str, Any]:
     """
     Transcript pipeline:
-      1. Try accessible captions.
-      2. If unavailable, obtain authorized audio.
-      3. Transcribe locally with faster-whisper.
+
+    1. Try YouTube captions.
+    2. If captions unavailable, download audio with yt-dlp.
+    3. Transcribe with Faster-Whisper.
     """
+
+    # First attempt: YouTube captions
     try:
         return get_caption_transcript(video_id)
+
     except Exception:
-        # Caption failure intentionally triggers local STT fallback.
+        # No accessible captions.
         pass
 
-    temp_dir = tempfile.mkdtemp(prefix="yt_transcript_")
+    # Fallback: local/worker transcription
+    temp_dir = tempfile.mkdtemp(
+        prefix="yt_transcript_"
+    )
 
     try:
-        audio_path = download_audio(video_id, temp_dir)
-        result = transcribe_with_whisper(audio_path)
+        audio_path = download_audio(
+            video_id,
+            temp_dir
+        )
+
+        result = transcribe_with_whisper(
+            audio_path
+        )
+
         result["video_id"] = video_id
+
         return result
+
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True
+        )
